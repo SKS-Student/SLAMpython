@@ -1,0 +1,123 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN
+import time
+
+# Initialize camera
+camera = cv2.VideoCapture(0)
+
+# Camera intrinsics (adjust as needed)
+K = np.array([[700, 0, 320],
+              [0, 700, 240],
+              [0,   0,   1]])
+
+# ORB and matcher
+orb = cv2.ORB_create(2000)
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+# Read first frame
+ret, prev_frame = camera.read()
+if not ret:
+    print("Cannot read from camera.")
+    exit()
+
+prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+prev_kp, prev_des = orb.detectAndCompute(prev_gray, None)
+
+# 3D points storage
+all_points_3d = []
+start_time = time.time()
+
+print("Running SLAM. Press 'q' to quit.")
+
+while True:
+    ret, frame = camera.read()
+    if not ret:
+        print("Can't receive frame. Exiting...")
+        break
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    kp, des = orb.detectAndCompute(gray, None)
+
+    if des is not None and prev_des is not None:
+        matches = bf.match(prev_des, des)
+        matches = sorted(matches, key=lambda x: x.distance)
+
+        if len(matches) >= 8:
+            pts1 = np.float32([prev_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+            pts2 = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+            E, _ = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            if E is not None:
+                _, R, t, _ = cv2.recoverPose(E, pts1, pts2, K)
+
+                proj1 = np.hstack((np.eye(3), np.zeros((3, 1))))
+                proj2 = np.hstack((R, t))
+                pts1_norm = cv2.undistortPoints(pts1, K, None)
+                pts2_norm = cv2.undistortPoints(pts2, K, None)
+                points_4d = cv2.triangulatePoints(proj1, proj2, pts1_norm, pts2_norm)
+                points_3d = points_4d[:3] / points_4d[3]
+                all_points_3d.append(points_3d.T)
+
+        # Show matches
+        match_img = cv2.drawMatches(prev_frame, prev_kp, frame, kp, matches[:200], None, flags=2)
+        cv2.imshow("Feature Matches", match_img)
+
+    prev_frame = frame.copy()
+    prev_gray = gray.copy()
+    prev_kp = kp
+    prev_des = des
+
+    white_frame = np.ones_like(frame) * 255
+    keypoints_img = cv2.drawKeypoints(white_frame, kp, None, color=(0, 0, 255))
+    cv2.imshow("Camera", frame)
+    cv2.imshow("Keypoints", keypoints_img)
+
+    # After 30 seconds, stop capturing and analyze
+    if time.time() - start_time >= 30:
+        print("⏱️ 30 seconds passed. Processing point cloud...")
+        break
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        print("Exiting early.")
+        break
+
+camera.release()
+cv2.destroyAllWindows()
+
+# === Point cloud analysis ===
+if all_points_3d:
+    points = np.vstack(all_points_3d)
+
+    # Cluster points
+    clustering = DBSCAN(eps=0.1, min_samples=30).fit(points)
+    labels = clustering.labels_
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title("3D Map with Objects")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+
+    # Draw points and estimate dimensions
+    unique_labels = np.unique(labels)
+    for label in unique_labels:
+        if label == -1:
+            continue  # Noise
+        obj_points = points[labels == label]
+        min_pt = obj_points.min(axis=0)
+        max_pt = obj_points.max(axis=0)
+        dims = max_pt - min_pt
+
+        print(f"Object {label}: Width={dims[0]:.2f}, Height={dims[1]:.2f}, Depth={dims[2]:.2f}")
+        ax.scatter(obj_points[:, 0], obj_points[:, 1], obj_points[:, 2], s=5, label=f"Obj {label}")
+
+    ax.legend()
+    ax.grid(True)
+    ax.view_init(elev=135, azim=-90)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No 3D points collected.")
